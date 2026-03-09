@@ -8,10 +8,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
-	"golang.zx2c4.com/wireguard/device"
 	"io"
 	"log"
 	"math/rand"
@@ -21,11 +17,17 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
+	"golang.zx2c4.com/wireguard/device"
+
 	"github.com/sourcegraph/conc"
-	"github.com/things-go/go-socks5"
-	"github.com/things-go/go-socks5/bufferpool"
+	// "github.com/things-go/go-socks5"
+	// "github.com/things-go/go-socks5/bufferpool"
 
 	"net/netip"
 
@@ -53,7 +55,7 @@ type VirtualTun struct {
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
 type RoutineSpawner interface {
-	SpawnRoutine(vt *VirtualTun)
+	SpawnRoutine(dev *DeviceConfig, s chan os.Signal)
 }
 
 type addressPort struct {
@@ -138,40 +140,73 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 }
 
 // SpawnRoutine spawns a socks5 server.
-func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
-	var authMethods []socks5.Authenticator
-	if username := config.Username; username != "" {
-		authMethods = append(authMethods, socks5.UserPassAuthenticator{
-			Credentials: socks5.StaticCredentials{username: config.Password},
-		})
-	} else {
-		authMethods = append(authMethods, socks5.NoAuthAuthenticator{})
-	}
+// func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
+// 	var authMethods []socks5.Authenticator
+// 	if username := config.Username; username != "" {
+// 		authMethods = append(authMethods, socks5.UserPassAuthenticator{
+// 			Credentials: socks5.StaticCredentials{username: config.Password},
+// 		})
+// 	} else {
+// 		authMethods = append(authMethods, socks5.NoAuthAuthenticator{})
+// 	}
 
-	options := []socks5.Option{
-		socks5.WithDial(vt.Tnet.DialContext),
-		socks5.WithResolver(vt),
-		socks5.WithAuthMethods(authMethods),
-		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
-	}
+// 	options := []socks5.Option{
+// 		socks5.WithDial(vt.Tnet.DialContext),
+// 		socks5.WithResolver(vt),
+// 		socks5.WithAuthMethods(authMethods),
+// 		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
+// 	}
 
-	server := socks5.NewServer(options...)
+// 	server := socks5.NewServer(options...)
 
-	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
-		log.Fatal(err)
-	}
-}
+// 	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
+// 		log.Fatal(err)
+// 	}
+// }
 
 // SpawnRoutine spawns a http server.
-func (config *HTTPConfig) SpawnRoutine(vt *VirtualTun) {
+func (config *HTTPConfig) SpawnRoutine(dev *DeviceConfig, s chan os.Signal) {
 	server := &HTTPServer{
 		config: config,
-		dial:   vt.Tnet.Dial,
+		dev:    dev,
 		auth:   CredentialValidator{config.Username, config.Password},
 	}
 	if config.Username != "" || config.Password != "" {
 		server.authRequired = true
 	}
+	tun, err := StartWireguard(dev, device.LogLevelVerbose)
+	if err != nil {
+		log.Fatal(err)
+		panic(err)
+	} else {
+		server.vt = tun
+		server.devCloseWG = &sync.WaitGroup{}
+		server.vtLock = &sync.RWMutex{}
+	}
+	go func() {
+		for {
+			<-s
+			go func() {
+				log.Printf("received sighup, restarting wireguard")
+				tun, err := StartWireguard(dev, device.LogLevelVerbose)
+				if err != nil {
+					log.Fatal(err)
+					panic(err)
+				} else {
+					server.vtLock.Lock()
+					server.devCloseWGLock.Lock()
+					oldVT := server.vt
+					oldDevCloseWG := server.devCloseWG
+					server.devCloseWG = &sync.WaitGroup{}
+					server.vt = tun
+					server.devCloseWGLock.Unlock()
+					server.vtLock.Unlock()
+					oldDevCloseWG.Wait()
+					oldVT.Dev.Close()
+				}
+			}()
+		}
+	}()
 
 	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
 		log.Fatal(err)
@@ -263,35 +298,35 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
 }
 
 // SpawnRoutine spawns a local TCP server which acts as a proxy to the specified target
-func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	raddr, err := parseAddressPort(conf.Target)
-	if err != nil {
-		log.Fatal(err)
-	}
+// func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+// 	raddr, err := parseAddressPort(conf.Target)
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
 
-	server, err := net.ListenTCP("tcp", conf.BindAddress)
-	if err != nil {
-		log.Fatal(err)
-	}
+// 	server, err := net.ListenTCP("tcp", conf.BindAddress)
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
 
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		go tcpClientForward(vt, raddr, conn)
-	}
-}
+// 	for {
+// 		conn, err := server.Accept()
+// 		if err != nil {
+// 			log.Fatal(err)
+// 		}
+// 		go tcpClientForward(vt, raddr, conn)
+// 	}
+// }
 
 // SpawnRoutine connects to the specified target and plumbs it to STDIN / STDOUT
-func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	raddr, err := parseAddressPort(conf.Target)
-	if err != nil {
-		log.Fatal(err)
-	}
+// func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+// 	raddr, err := parseAddressPort(conf.Target)
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
 
-	go STDIOTcpForward(vt, raddr)
-}
+// 	go STDIOTcpForward(vt, raddr)
+// }
 
 // tcpServerForward starts a new connection locally and forward traffic from `conn`
 func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
@@ -326,26 +361,26 @@ func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 }
 
 // SpawnRoutine spawns a TCP server on wireguard which acts as a proxy to the specified target
-func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	raddr, err := parseAddressPort(conf.Target)
-	if err != nil {
-		log.Fatal(err)
-	}
+// func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+// 	raddr, err := parseAddressPort(conf.Target)
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
 
-	addr := &net.TCPAddr{Port: conf.ListenPort}
-	server, err := vt.Tnet.ListenTCP(addr)
-	if err != nil {
-		log.Fatal(err)
-	}
+// 	addr := &net.TCPAddr{Port: conf.ListenPort}
+// 	server, err := vt.Tnet.ListenTCP(addr)
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
 
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		go tcpServerForward(vt, raddr, conn)
-	}
-}
+// 	for {
+// 		conn, err := server.Accept()
+// 		if err != nil {
+// 			log.Fatal(err)
+// 		}
+// 		go tcpServerForward(vt, raddr, conn)
+// 	}
+// }
 
 func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Health metric request: %s\n", r.URL.Path)

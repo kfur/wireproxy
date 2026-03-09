@@ -3,6 +3,7 @@ package wireproxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/sourcegraph/conc"
 )
@@ -19,8 +22,13 @@ const proxyAuthHeaderKey = "Proxy-Authorization"
 type HTTPServer struct {
 	config *HTTPConfig
 
-	auth CredentialValidator
-	dial func(network, address string) (net.Conn, error)
+	auth           CredentialValidator
+	dev            *DeviceConfig
+	vt             *VirtualTun
+	vtLock         *sync.RWMutex
+	devCloseWG     *sync.WaitGroup
+	devCloseWGLock sync.Mutex
+	// dial func(network, address string) (net.Conn, error)
 
 	authRequired bool
 }
@@ -50,49 +58,6 @@ func (s *HTTPServer) authenticate(req *http.Request) (int, error) {
 	return http.StatusProxyAuthRequired, fmt.Errorf(http.StatusText(http.StatusProxyAuthRequired))
 }
 
-func (s *HTTPServer) handleConn(req *http.Request, conn net.Conn) (peer net.Conn, err error) {
-	addr := req.Host
-	if !strings.Contains(addr, ":") {
-		port := "443"
-		addr = net.JoinHostPort(addr, port)
-	}
-
-	peer, err = s.dial("tcp", addr)
-	if err != nil {
-		return peer, fmt.Errorf("tun tcp dial failed: %w", err)
-	}
-
-	_, err = conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
-	if err != nil {
-		_ = peer.Close()
-		peer = nil
-	}
-
-	return
-}
-
-func (s *HTTPServer) handle(req *http.Request) (peer net.Conn, err error) {
-	addr := req.Host
-	if !strings.Contains(addr, ":") {
-		port := "80"
-		addr = net.JoinHostPort(addr, port)
-	}
-
-	peer, err = s.dial("tcp", addr)
-	if err != nil {
-		return peer, fmt.Errorf("tun tcp dial failed: %w", err)
-	}
-
-	err = req.Write(peer)
-	if err != nil {
-		_ = peer.Close()
-		peer = nil
-		return peer, fmt.Errorf("conn write failed: %w", err)
-	}
-
-	return
-}
-
 func (s *HTTPServer) serve(conn net.Conn) {
 	var rd = bufio.NewReader(conn)
 	req, err := http.ReadRequest(rd)
@@ -108,12 +73,23 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		return
 	}
 
+	// tun, err := StartWireguard(s.dev, device.LogLevelVerbose)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// tun.StartPingIPs()
 	var peer net.Conn
+	s.vtLock.RLock()
+	ps := &ProxyServer{
+		vt: s.vt,
+	}
+	defer s.vtLock.RUnlock()
 	switch req.Method {
 	case http.MethodConnect:
-		peer, err = s.handleConn(req, conn)
+
+		peer, err = ps.handleConn(req, conn)
 	case http.MethodGet:
-		peer, err = s.handle(req)
+		peer, err = ps.handle(req)
 	default:
 		_ = responseWith(req, http.StatusMethodNotAllowed).Write(conn)
 		log.Printf("unsupported protocol: %s\n", req.Method)
@@ -128,22 +104,38 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		return
 	}
 	go func() {
+		// defer tun.Dev.Close()
+		s.devCloseWGLock.Lock()
+		s.devCloseWG.Add(2)
 		wg := conc.NewWaitGroup()
 		wg.Go(func() {
+			defer s.devCloseWG.Done()
 			_, err = io.Copy(conn, peer)
 			_ = conn.Close()
 		})
 		wg.Go(func() {
+			defer s.devCloseWG.Done()
 			_, err = io.Copy(peer, conn)
 			_ = peer.Close()
 		})
+		s.devCloseWGLock.Unlock()
+
 		wg.Wait()
 	}()
 }
 
 // ListenAndServe is used to create a listener and serve on it
 func (s *HTTPServer) ListenAndServe(network, addr string) error {
-	server, err := net.Listen(network, addr)
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			})
+			return err
+		},
+	}
+	server, err := lc.Listen(context.Background(), network, addr)
 	if err != nil {
 		return fmt.Errorf("listen tcp failed: %w", err)
 	}
