@@ -17,7 +17,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -55,7 +54,7 @@ type VirtualTun struct {
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
 type RoutineSpawner interface {
-	SpawnRoutine(dev *DeviceConfig, s chan os.Signal)
+	SpawnRoutine(dev *DeviceConfig)
 }
 
 type addressPort struct {
@@ -165,7 +164,7 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 // }
 
 // SpawnRoutine spawns a http server.
-func (config *HTTPConfig) SpawnRoutine(dev *DeviceConfig, s chan os.Signal) {
+func (config *HTTPConfig) SpawnRoutine(dev *DeviceConfig) {
 	server := &HTTPServer{
 		config: config,
 		dev:    dev,
@@ -174,39 +173,37 @@ func (config *HTTPConfig) SpawnRoutine(dev *DeviceConfig, s chan os.Signal) {
 	if config.Username != "" || config.Password != "" {
 		server.authRequired = true
 	}
-	tun, err := StartWireguard(dev, device.LogLevelVerbose)
-	if err != nil {
-		log.Fatal(err)
-		panic(err)
-	} else {
-		server.vt = tun
-		server.devCloseWG = &sync.WaitGroup{}
-		server.vtLock = &sync.RWMutex{}
-	}
-	go func() {
-		for {
-			<-s
-			go func() {
-				log.Printf("received sighup, restarting wireguard")
-				tun, err := StartWireguard(dev, device.LogLevelVerbose)
-				if err != nil {
-					log.Fatal(err)
-					panic(err)
-				} else {
-					server.vtLock.Lock()
-					server.devCloseWGLock.Lock()
-					oldVT := server.vt
-					oldDevCloseWG := server.devCloseWG
-					server.devCloseWG = &sync.WaitGroup{}
-					server.vt = tun
-					server.devCloseWGLock.Unlock()
-					server.vtLock.Unlock()
-					oldDevCloseWG.Wait()
-					oldVT.Dev.Close()
-				}
-			}()
-		}
-	}()
+	// tun, err := StartWireguard(dev, device.LogLevelVerbose)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// 	panic(err)
+	// } else {
+	// 	server.vt = tun
+	// 	server.devCloseWG = &sync.WaitGroup{}
+	// }
+	// go func() {
+	// 	for {
+	// 		<-s
+	// 		log.Printf("received sighup, restarting wireguard")
+	// 		tun, err := StartWireguard(dev, device.LogLevelVerbose)
+	// 		if err != nil {
+	// 			log.Fatal(err)
+	// 			panic(err)
+	// 		} else {
+	// 			server.vtLock.Lock()
+	// 			oldVT := server.vt
+	// 			server.vt = tun
+	// 			server.vtLock.Unlock()
+	// 			server.devCloseWGLock.Lock()
+	// 			oldDevCloseWG := server.devCloseWG
+	// 			server.devCloseWG = &sync.WaitGroup{}
+	// 			server.devCloseWGLock.Unlock()
+	// 			// tun.StartPingIPs()
+	// 			oldDevCloseWG.Wait()
+	// 			oldVT.Dev.Close()
+	// 		}
+	// 	}
+	// }()
 
 	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
 		log.Fatal(err)

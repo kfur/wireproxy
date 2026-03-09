@@ -11,10 +11,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/sourcegraph/conc"
+	"golang.zx2c4.com/wireguard/device"
 )
 
 const proxyAuthHeaderKey = "Proxy-Authorization"
@@ -22,12 +22,8 @@ const proxyAuthHeaderKey = "Proxy-Authorization"
 type HTTPServer struct {
 	config *HTTPConfig
 
-	auth           CredentialValidator
-	dev            *DeviceConfig
-	vt             *VirtualTun
-	vtLock         *sync.RWMutex
-	devCloseWG     *sync.WaitGroup
-	devCloseWGLock sync.Mutex
+	auth CredentialValidator
+	dev  *DeviceConfig
 	// dial func(network, address string) (net.Conn, error)
 
 	authRequired bool
@@ -73,17 +69,15 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		return
 	}
 
-	// tun, err := StartWireguard(s.dev, device.LogLevelVerbose)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// tun.StartPingIPs()
-	var peer net.Conn
-	s.vtLock.RLock()
-	ps := &ProxyServer{
-		vt: s.vt,
+	tun, err := StartWireguard(s.dev, device.LogLevelVerbose)
+	if err != nil {
+		log.Fatal(err)
 	}
-	defer s.vtLock.RUnlock()
+	// tun.StartPingIPs()
+	ps := &ProxyServer{
+		vt: tun,
+	}
+	var peer net.Conn
 	switch req.Method {
 	case http.MethodConnect:
 
@@ -104,22 +98,16 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		return
 	}
 	go func() {
-		// defer tun.Dev.Close()
-		s.devCloseWGLock.Lock()
-		s.devCloseWG.Add(2)
+		defer tun.Dev.Close()
 		wg := conc.NewWaitGroup()
 		wg.Go(func() {
-			defer s.devCloseWG.Done()
 			_, err = io.Copy(conn, peer)
 			_ = conn.Close()
 		})
 		wg.Go(func() {
-			defer s.devCloseWG.Done()
 			_, err = io.Copy(peer, conn)
 			_ = peer.Close()
 		})
-		s.devCloseWGLock.Unlock()
-
 		wg.Wait()
 	}()
 }
