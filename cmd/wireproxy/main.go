@@ -3,24 +3,29 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/landlock-lsm/go-landlock/landlock"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strconv"
 	"syscall"
 
+	"github.com/landlock-lsm/go-landlock/landlock"
+
 	"github.com/akamensky/argparse"
 	"github.com/pufferffish/wireproxy"
-	"golang.zx2c4.com/wireguard/device"
 	"suah.dev/protect"
 )
 
 // an argument to denote that this process was spawned by -d
 const daemonProcess = "daemon-process"
+
+// default paths for wireproxy config file
+var default_config_paths = []string{
+	"/etc/wireproxy/wireproxy.conf",
+	os.Getenv("HOME") + "/.config/wireproxy.conf",
+}
 
 var version = "1.0.8-dev"
 
@@ -49,6 +54,16 @@ func executablePath() string {
 		return os.Args[0]
 	}
 	return programPath
+}
+
+// check if default config file paths exist
+func configFilePath() (string, bool) {
+	for _, path := range default_config_paths {
+		if _, err := os.Stat(path); err == nil {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 func lock(stage string) {
@@ -122,14 +137,14 @@ func lockNetwork(sections []wireproxy.RoutineSpawner, infoAddr *string) {
 
 	for _, section := range sections {
 		switch section := section.(type) {
-		case *wireproxy.TCPServerTunnelConfig:
-			rules = append(rules, landlock.ConnectTCP(extractPort(section.Target)))
+		// case *wireproxy.TCPServerTunnelConfig:
+		// 	rules = append(rules, landlock.ConnectTCP(extractPort(section.Target)))
 		case *wireproxy.HTTPConfig:
 			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
-		case *wireproxy.TCPClientTunnelConfig:
-			rules = append(rules, landlock.ConnectTCP(uint16(section.BindAddress.Port)))
-		case *wireproxy.Socks5Config:
-			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+			// case *wireproxy.TCPClientTunnelConfig:
+			// 	rules = append(rules, landlock.ConnectTCP(uint16(section.BindAddress.Port)))
+			// case *wireproxy.Socks5Config:
+			// 	rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
 		}
 	}
 
@@ -137,14 +152,17 @@ func lockNetwork(sections []wireproxy.RoutineSpawner, infoAddr *string) {
 }
 
 func main() {
-	s := make(chan os.Signal, 1)
-	signal.Notify(s, syscall.SIGINT, syscall.SIGQUIT)
+	sIQ := make(chan os.Signal, 1)
+	signal.Notify(sIQ, syscall.SIGINT, syscall.SIGQUIT)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
-		<-s
+		<-sIQ
 		cancel()
 	}()
+
+	sH := make(chan os.Signal, 1)
+	signal.Notify(sH, syscall.SIGHUP)
 
 	exePath := executablePath()
 	lock("boot")
@@ -159,7 +177,7 @@ func main() {
 	parser := argparse.NewParser("wireproxy", "Userspace wireguard client for proxying")
 
 	config := parser.String("c", "config", &argparse.Options{Help: "Path of configuration file"})
-	silent := parser.Flag("s", "silent", &argparse.Options{Help: "Silent mode"})
+	// silent := parser.Flag("s", "silent", &argparse.Options{Help: "Silent mode"})
 	daemon := parser.Flag("d", "daemon", &argparse.Options{Help: "Make wireproxy run in background"})
 	info := parser.String("i", "info", &argparse.Options{Help: "Specify the address and port for exposing health status"})
 	printVerison := parser.Flag("v", "version", &argparse.Options{Help: "Print version"})
@@ -177,8 +195,12 @@ func main() {
 	}
 
 	if *config == "" {
-		fmt.Println("configuration path is required")
-		return
+		if path, config_exist := configFilePath(); config_exist {
+			*config = path
+		} else {
+			fmt.Println("configuration path is required")
+			return
+		}
 	}
 
 	if !*daemon {
@@ -217,32 +239,33 @@ func main() {
 	// https://github.com/WireGuard/wireguard-go/blob/master/device/logger.go#L39
 	// so redirect STDOUT to STDERR, we don't want to print anything to STDOUT anyways
 	os.Stdout = os.NewFile(uintptr(syscall.Stderr), "/dev/stderr")
-	logLevel := device.LogLevelVerbose
-	if *silent {
-		logLevel = device.LogLevelSilent
-	}
+	// logLevel := device.LogLevelVerbose
+	// if *silent {
+	// 	logLevel = device.LogLevelSilent
+	// }
 
 	lock("ready")
 
-	tun, err := wireproxy.StartWireguard(conf.Device, logLevel)
-	if err != nil {
-		log.Fatal(err)
-	}
+	// tun, err := wireproxy.StartWireguard(conf.Device, logLevel)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
 
 	for _, spawner := range conf.Routines {
-		go spawner.SpawnRoutine(tun)
+		go spawner.SpawnRoutine(conf.Device, sH)
 	}
 
-	tun.StartPingIPs()
+	// tun.StartPingIPs()
 
-	if *info != "" {
-		go func() {
-			err := http.ListenAndServe(*info, tun)
-			if err != nil {
-				panic(err)
-			}
-		}()
-	}
+	// if *info != "" {
+	// 	go func() {
+	// 		err := http.ListenAndServe(*info, tun)
+	// 		if err != nil {
+	// 			panic(err)
+	// 		}
+	// 	}()
+	// }
 
 	<-ctx.Done()
+	// tun.Dev.Close()
 }
