@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/sourcegraph/conc"
 	"golang.zx2c4.com/wireguard/device"
@@ -57,6 +58,10 @@ func (s *HTTPServer) authenticate(req *http.Request) (int, error) {
 func (s *HTTPServer) serve(conn net.Conn) {
 	var rd = bufio.NewReader(conn)
 	req, err := http.ReadRequest(rd)
+	deadline := time.Now().Add(20 * time.Second)
+	_ = conn.SetDeadline(deadline)
+
+	defer conn.Close()
 	if err != nil {
 		log.Printf("read request failed: %s\n", err)
 		return
@@ -73,6 +78,7 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer tun.Dev.Close()
 	// tun.StartPingIPs()
 	ps := &ProxyServer{
 		vt: tun,
@@ -97,19 +103,17 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		log.Println("dial proxy failed: peer nil")
 		return
 	}
-	go func() {
-		defer tun.Dev.Close()
-		wg := conc.NewWaitGroup()
-		wg.Go(func() {
-			_, err = io.Copy(conn, peer)
-			_ = conn.Close()
-		})
-		wg.Go(func() {
-			_, err = io.Copy(peer, conn)
-			_ = peer.Close()
-		})
-		wg.Wait()
-	}()
+	_ = peer.SetDeadline(deadline)
+
+	wg := conc.NewWaitGroup()
+	wg.Go(func() {
+		_, err = io.Copy(conn, peer)
+	})
+	wg.Go(func() {
+		defer peer.Close()
+		_, err = io.Copy(peer, rd)
+	})
+	wg.Wait()
 }
 
 // ListenAndServe is used to create a listener and serve on it
